@@ -72,4 +72,4 @@ Open **[http://localhost:8000](http://localhost:8000)**.
 
 ## 🔐 Authentication
 - **Admin**: Sign in with `ADMIN_EMAIL` + `ADMIN_PASSWORD` or with Google.
-- **Employees**: Added by admin under **Admin** → **Give someone access**. They can sign in with Google or a password set by the admin.
+- **Employees**: Added by admin under **Admin** → **Give someone access** by email. On their first login (via Google or admin invite), they are prompted to create their personal password, allowing them to also sign in directly using email and password. Employees can update their password anytime from their dashboard sidebar.

@@ -196,6 +196,10 @@ class AdminIn(BaseModel):
     password: str = Field(..., max_length=128)
 
 
+class PasswordSetIn(BaseModel):
+    password: str = Field(..., min_length=6, max_length=128)
+
+
 class ReqIn(BaseModel):
     kind: str = Field(..., max_length=10)
     type: Optional[str] = Field(None, max_length=20)
@@ -396,7 +400,15 @@ def admin_login(b: AdminIn, req: Request):
         else:
             # 2. Check registered employees/admins with a password_hash
             row = c.execute("SELECT id, password_hash, active FROM employees WHERE email=?", (clean_email,)).fetchone()
-            if row and row["active"] and row["password_hash"]:
+            if row and row["active"]:
+                if clean_email == ADMIN_EMAIL.strip().lower() and ADMIN_PASSWORD:
+                    rate_limiter.record_failure(ip, clean_email)
+                    time.sleep(0.15)
+                    raise HTTPException(403, "Wrong email or password")
+                if not row["password_hash"]:
+                    rate_limiter.record_failure(ip, clean_email)
+                    time.sleep(0.15)
+                    raise HTTPException(400, "No password set yet. Please sign in with Google to set your password.")
                 if verify_password(b.password, row["password_hash"]):
                     user_id = row["id"]
 
@@ -427,6 +439,15 @@ def logout(req: Request):
         with db() as c:
             c.execute("DELETE FROM sessions WHERE token=?", (token,))
     req.session.clear()
+    return {"ok": True}
+
+
+@app.post("/api/auth/password")
+def update_password(b: PasswordSetIn, u=Depends(user)):
+    p_hash = hash_password(b.password)
+    with db() as c:
+        c.execute("UPDATE employees SET password_hash=? WHERE id=?", (p_hash, u["id"]))
+        log(c, u["name"], "Created or updated personal password")
     return {"ok": True}
 
 
@@ -508,7 +529,9 @@ def state(u=Depends(user)):
         hol = [dict(d=h["date"], n=h["name"]) for h in c.execute("SELECT * FROM holidays ORDER BY date")]
         p = c.execute("SELECT * FROM policy").fetchone()
         aud = [dict(t=a["at"], who=a["who"], a=a["action"]) for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")] if adm else []
-    return dict(me=u["id"], employees=emps, requests=reqs, adj=adj, quotas=quotas, types=types, holidays=hol,
+    is_master = bool(ADMIN_EMAIL and u.get("email", "").strip().lower() == ADMIN_EMAIL.strip().lower() and ADMIN_PASSWORD)
+    has_pwd = bool(u.get("password_hash")) or is_master
+    return dict(me=u["id"], has_password=has_pwd, employees=emps, requests=reqs, adj=adj, quotas=quotas, types=types, holidays=hol,
                 policy=dict(q=p["quota"], max=p["max_remote"], off=p["max_off"]), audit=aud)
 
 
