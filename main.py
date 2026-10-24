@@ -90,6 +90,10 @@ CREATE TABLE IF NOT EXISTS sessions(
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp);
+CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date);
+CREATE INDEX IF NOT EXISTS idx_adjustments_emp ON adjustments(emp);
+CREATE INDEX IF NOT EXISTS idx_quotas_emp ON quotas(emp);
 """
 
 
@@ -123,7 +127,11 @@ with db() as c:
     for stmt in (
         "ALTER TABLE policy ADD COLUMN max_off INTEGER DEFAULT 2",
         "ALTER TABLE adjustments ADD COLUMN year INTEGER",
-        "ALTER TABLE employees ADD COLUMN password_hash TEXT DEFAULT ''"
+        "ALTER TABLE employees ADD COLUMN password_hash TEXT DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp)",
+        "CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date)",
+        "CREATE INDEX IF NOT EXISTS idx_adjustments_emp ON adjustments(emp)",
+        "CREATE INDEX IF NOT EXISTS idx_quotas_emp ON quotas(emp)",
     ):
         try:
             c.execute(stmt)
@@ -135,26 +143,73 @@ with db() as c:
     c.execute("INSERT OR IGNORE INTO employees(name,email,title,role,active) VALUES('Admin',?,'Administrator','admin',1)", (ADMIN_EMAIL,))
     c.execute("UPDATE employees SET role='admin', active=1 WHERE email=?", (ADMIN_EMAIL,))
 
+if ADMIN_PASSWORD in ("admin", "password", "123456", "admin123"):
+    print("[SECURITY NOTICE] ADMIN_PASSWORD is set to a common default. Please configure a strong password in production!")
+if SECRET == "leaf-secret-key-change-me":
+    print("[SECURITY NOTICE] SECRET_KEY is set to default. Please configure a strong random key in production!")
+
+
+class RequestRateLimiter:
+    def __init__(self, max_requests=120, window_seconds=60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests: Dict[str, list] = {}
+        self.last_cleanup = time.time()
+
+    def check(self, ip: str) -> bool:
+        now = time.time()
+        if now - self.last_cleanup > 30:
+            self.last_cleanup = now
+            cutoff = now - self.window_seconds
+            for k in list(self.requests.keys()):
+                self.requests[k] = [t for t in self.requests[k] if t > cutoff]
+                if not self.requests[k]:
+                    del self.requests[k]
+        cutoff = now - self.window_seconds
+        history = [t for t in self.requests.get(ip, []) if t > cutoff]
+        if len(history) >= self.max_requests:
+            return False
+        history.append(now)
+        self.requests[ip] = history
+        return True
+
+
+api_limiter = RequestRateLimiter(max_requests=120, window_seconds=60)
+
 
 class SecurityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # 1. CSRF Protection for state-changing requests
+        client_ip = request.client.host if request.client else "unknown"
+
+        # 1. API Rate Limiting (120 req/min per IP) to prevent DoS & automated abuse
+        if request.url.path.startswith("/api/") and not api_limiter.check(client_ip):
+            return JSONResponse(status_code=429, content={"detail": "Too many requests. Please slow down."})
+
+        # 2. CSRF Protection for state-changing requests (Origin & Referer validation)
         if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+            host = request.headers.get("host")
             origin = request.headers.get("origin")
             if origin:
-                host = request.headers.get("host")
                 origin_host = origin.split("://")[-1].rstrip("/")
                 if host and origin_host != host:
                     return JSONResponse(status_code=403, content={"detail": "Cross-origin request rejected"})
+            else:
+                referer = request.headers.get("referer")
+                if referer:
+                    ref_host = referer.split("://")[-1].split("/")[0]
+                    if host and ref_host != host:
+                        return JSONResponse(status_code=403, content={"detail": "Cross-origin referer rejected"})
 
-        # 2. Process request
+        # 3. Process request
         response: Response = await call_next(request)
 
-        # 3. Security Headers
+        # 4. Comprehensive Security Headers
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "script-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/client; "
@@ -166,10 +221,13 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             "base-uri 'self'; "
             "form-action 'self';"
         )
+        if os.getenv("COOKIE_SECURE", "false").lower() == "true":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
         return response
 
 
-app = FastAPI(title="Leaf – Leave & WFH", docs_url=None, redoc_url=None)
+# Disable docs, redoc, and openapi.json in production
+app = FastAPI(title="Leaf – Leave & WFH", docs_url=None, redoc_url=None, openapi_url=None)
 app.add_middleware(SessionMiddleware, secret_key=SECRET, same_site="lax", max_age=7 * 86400,
                    https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true")
 app.add_middleware(SecurityMiddleware)
@@ -209,11 +267,23 @@ class ReqIn(BaseModel):
     reason: str = Field("", max_length=500)
     emp: Optional[int] = None
 
+    @field_validator("reason")
+    def sanitize_reason(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid character in reason")
+        return v.strip()
+
 
 class DecideIn(BaseModel):
     action: str = Field(..., max_length=20)
     note: str = Field("", max_length=300)
     force: bool = False
+
+    @field_validator("note")
+    def sanitize_note(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid character in note")
+        return v.strip()
 
 
 class AdjIn(BaseModel):
@@ -221,6 +291,12 @@ class AdjIn(BaseModel):
     type: str = Field(..., max_length=20)
     days: float
     reason: str = Field(..., min_length=1, max_length=500)
+
+    @field_validator("reason")
+    def sanitize_adj_reason(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid character in reason")
+        return v.strip()
 
     @field_validator("days")
     def check_days(cls, v):
@@ -235,6 +311,12 @@ class EmpIn(BaseModel):
     title: str = Field("", max_length=100)
     role: str = Field("employee", max_length=20)
     password: Optional[str] = Field(None, max_length=128)
+
+    @field_validator("name", "title")
+    def sanitize_person(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid characters detected")
+        return v.strip()
 
 
 class EmpEditIn(EmpIn):
@@ -254,6 +336,12 @@ class TypeIn(BaseModel):
     quota: float = 0
     tracked: bool = True
 
+    @field_validator("name")
+    def sanitize_name(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid characters detected")
+        return v.strip()
+
     @field_validator("quota")
     def check_quota(cls, v):
         if not math.isfinite(v) or v < 0 or v > 365:
@@ -264,6 +352,12 @@ class TypeIn(BaseModel):
 class HolIn(BaseModel):
     date: str = Field(..., max_length=10)
     name: str = Field(..., min_length=1, max_length=100)
+
+    @field_validator("name")
+    def sanitize_hol_name(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid characters detected")
+        return v.strip()
 
 
 class PolIn(BaseModel):
@@ -344,22 +438,31 @@ def config():
 
 @app.post("/api/auth/google")
 def google_login(b: GoogleIn, req: Request):
+    ip = req.client.host if req.client else "unknown"
+    allowed, wait_secs = rate_limiter.check(ip, "google_login")
+    if not allowed:
+        raise HTTPException(429, f"Too many sign-in attempts. Try again in {max(1, wait_secs // 60)} minutes.")
+
     if not CLIENT_ID:
         raise HTTPException(403, "Google sign-in isn’t configured")
     try:
         info = id_token.verify_oauth2_token(b.credential, grequests.Request(), CLIENT_ID)
     except Exception:
+        rate_limiter.record_failure(ip, "google_login")
         raise HTTPException(403, "Google sign-in failed. Please try again.")
 
     email = (info.get("email") or "").strip().lower()
     if not info.get("email_verified") or not email:
+        rate_limiter.record_failure(ip, "google_login")
         raise HTTPException(403, "Your Google email isn’t verified")
 
     with db() as c:
         u = c.execute("SELECT * FROM employees WHERE email=? AND active=1", (email,)).fetchone()
     if not u:
+        rate_limiter.record_failure(ip, "google_login")
         raise HTTPException(403, f"{email} hasn’t been given access. Ask your admin to add it.")
 
+    rate_limiter.reset(ip, "google_login")
     token = secrets.token_hex(32)
     expires_at = time.time() + 7 * 86400
     ip = req.client.host if req.client else ""
@@ -443,7 +546,12 @@ def logout(req: Request):
 
 
 @app.post("/api/auth/password")
-def update_password(b: PasswordSetIn, u=Depends(user)):
+def update_password(b: PasswordSetIn, req: Request, u=Depends(user)):
+    ip = req.client.host if req.client else "unknown"
+    allowed, wait_secs = rate_limiter.check(ip, f"pwd_{u['id']}")
+    if not allowed:
+        raise HTTPException(429, f"Too many password changes. Try again in {max(1, wait_secs // 60)} minutes.")
+
     p_hash = hash_password(b.password)
     with db() as c:
         c.execute("UPDATE employees SET password_hash=? WHERE id=?", (p_hash, u["id"]))
