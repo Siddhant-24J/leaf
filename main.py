@@ -479,7 +479,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
 
 # Disable docs, redoc, and openapi.json in production
 app = FastAPI(title="Leaf – Leave & WFH", docs_url=None, redoc_url=None, openapi_url=None)
-app.add_middleware(SessionMiddleware, secret_key=SECRET, same_site="lax", max_age=7 * 86400,
+app.add_middleware(SessionMiddleware, secret_key=SECRET, same_site="lax", max_age=None,
                    https_only=os.getenv("COOKIE_SECURE", "false").lower() == "true")
 app.add_middleware(SecurityMiddleware)
 from fastapi.exceptions import RequestValidationError
@@ -745,7 +745,7 @@ def google_login(b: GoogleIn, req: Request):
 
     rate_limiter.reset(ip, "google_login")
     token = secrets.token_hex(32)
-    expires_at = time.time() + 7 * 86400
+    expires_at = time.time() + 86400
     ip = req.client.host if req.client else ""
     ua = req.headers.get("user-agent", "")[:200]
 
@@ -779,6 +779,9 @@ def admin_login(b: AdminIn, req: Request):
     with db() as c:
         if is_master_admin:
             admin_row = c.execute("SELECT id FROM employees WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+            if not admin_row:
+                c.execute("INSERT OR IGNORE INTO employees(name,email,title,role,active,emp_code) VALUES('Admin',?,'Administrator','admin',1,'ADM001')", (ADMIN_EMAIL,))
+                admin_row = c.execute("SELECT id FROM employees WHERE email=?", (ADMIN_EMAIL,)).fetchone()
             if admin_row:
                 user_id = admin_row["id"]
         else:
@@ -803,7 +806,7 @@ def admin_login(b: AdminIn, req: Request):
 
     rate_limiter.reset(ip, clean_email)
     token = secrets.token_hex(32)
-    expires_at = time.time() + 7 * 86400
+    expires_at = time.time() + 86400
     ua = req.headers.get("user-agent", "")[:200]
 
     with db() as c:
@@ -952,6 +955,9 @@ def state(u=Depends(user)):
         types = [[t["code"], t["name"], t["quota"], t["tracked"]] for t in c.execute("SELECT * FROM leave_types WHERE active=1")]
         hol = [dict(d=h["date"], n=h["name"]) for h in c.execute("SELECT * FROM holidays ORDER BY date")]
         p = c.execute("SELECT * FROM policy").fetchone()
+        if not p:
+            c.execute("INSERT OR IGNORE INTO policy(id,quota,max_remote,max_off) VALUES(1,4,3,2)")
+            p = c.execute("SELECT * FROM policy").fetchone()
         aud = [dict(t=a["at"], who=a["who"], a=a["action"]) for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")] if adm else []
 
         ot_sql = """
