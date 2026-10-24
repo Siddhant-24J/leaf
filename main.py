@@ -129,14 +129,34 @@ if TURSO_URL and TURSO_AUTH_TOKEN:
 class LibsqlRow(dict):
     """Emulates sqlite3.Row for dict access, index access, and dict(r)."""
     def __init__(self, cols, values):
-        super().__init__(zip(cols, values))
+        normalized = {}
+        for c, v in zip(cols, values):
+            c_str = str(c)
+            normalized[c] = v
+            normalized[c_str.lower()] = v
+            if "." in c_str:
+                short = c_str.split(".", 1)[1]
+                normalized[short] = v
+                normalized[short.lower()] = v
+        super().__init__(normalized)
         self._values = tuple(values)
         self._cols = tuple(cols)
 
     def __getitem__(self, key):
         if isinstance(key, int):
             return self._values[key]
+        key_str = str(key)
+        if key in self:
+            return super().__getitem__(key)
+        if key_str.lower() in self:
+            return super().__getitem__(key_str.lower())
         return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError):
+            return default
 
 
 class LibsqlCursorWrapper:
@@ -240,7 +260,16 @@ def today():
 
 def log(c, who, text):
     now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("INSERT INTO audit(at,who,action) VALUES(?,?,?)", (now_str, who, text))
+    try:
+        c.execute("INSERT INTO audit(at,who,action) VALUES(?,?,?)", (now_str, who, text))
+    except Exception:
+        try:
+            c.execute("INSERT INTO audit(at,who,a) VALUES(?,?,?)", (now_str, who, text))
+        except Exception:
+            try:
+                c.execute("INSERT INTO audit(at,who,text) VALUES(?,?,?)", (now_str, who, text))
+            except Exception:
+                pass
 
 
 def export_database_dict(c) -> dict:
@@ -368,6 +397,9 @@ with db() as c:
     ensure_column_exists(c, "employees", "password_hash", "TEXT DEFAULT ''")
     ensure_column_exists(c, "employees", "emp_code", "TEXT DEFAULT ''")
     ensure_column_exists(c, "requests", "ot_hours_used", "REAL DEFAULT 0")
+    ensure_column_exists(c, "audit", "action", "TEXT DEFAULT ''")
+    ensure_column_exists(c, "audit", "who", "TEXT DEFAULT ''")
+    ensure_column_exists(c, "audit", "at", "TEXT DEFAULT ''")
     for stmt in (
         "CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp)",
         "CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date)",
@@ -995,22 +1027,107 @@ def n_admins(c):
 def state(u=Depends(user)):
     adm = u["role"] == "admin"
     with db() as c:
-        emps = [dict(id=e["id"], code=e["emp_code"] or f"EMP{e['id']:03d}", n=e["name"], role=e["role"], t=e["title"], on=e["active"],
-                     ot_hours=get_overtime_summary(c, e["id"])["available_hours"],
-                     **({"email": e["email"]} if adm else {}))
-                for e in c.execute("SELECT * FROM employees ORDER BY id")]
-        q = "SELECT * FROM requests" + ("" if adm else " WHERE emp=?") + " ORDER BY id"
-        reqs = [rq(r, c) for r in c.execute(q, () if adm else (u["id"],))]
-        adj = {f'{a["emp"]}{a["type"]}': a["d"] for a in c.execute("SELECT emp,type,SUM(days) d FROM adjustments WHERE year=? GROUP BY emp,type", (today().year,))
-               if adm or a["emp"] == u["id"]}
-        quotas = {f'{x["emp"]}{x["type"]}': x["days"] for x in c.execute("SELECT * FROM quotas") if adm or x["emp"] == u["id"]}
-        types = [[t["code"], t["name"], t["quota"], t["tracked"]] for t in c.execute("SELECT * FROM leave_types WHERE active=1")]
-        hol = [dict(d=h["date"], n=h["name"]) for h in c.execute("SELECT * FROM holidays ORDER BY date")]
-        p = c.execute("SELECT * FROM policy").fetchone()
+        emps = []
+        try:
+            for row in c.execute("SELECT * FROM employees ORDER BY id"):
+                e = dict(row)
+                eid = e.get("id")
+                try:
+                    ot_summary = get_overtime_summary(c, eid)
+                    ot_avail = ot_summary.get("available_hours", 0.0)
+                except Exception:
+                    ot_avail = 0.0
+                ed = dict(
+                    id=eid,
+                    code=e.get("emp_code") or f"EMP{eid:03d}",
+                    n=e.get("name") or "",
+                    role=e.get("role", "employee"),
+                    t=e.get("title") or "",
+                    on=e.get("active", 1),
+                    ot_hours=ot_avail,
+                )
+                if adm:
+                    ed["email"] = e.get("email", "")
+                emps.append(ed)
+        except Exception as emp_err:
+            print(f"[State Notice] Employees query fallback: {emp_err}")
+            emps = []
+
+        reqs = []
+        try:
+            q = "SELECT * FROM requests" + ("" if adm else " WHERE emp=?") + " ORDER BY id"
+            for r in c.execute(q, () if adm else (u["id"],)):
+                reqs.append(rq(r, c))
+        except Exception as req_err:
+            print(f"[State Notice] Requests query fallback: {req_err}")
+            reqs = []
+
+        adj = {}
+        try:
+            for a in c.execute("SELECT emp,type,SUM(days) d FROM adjustments WHERE year=? GROUP BY emp,type", (today().year,)):
+                ad = dict(a)
+                if adm or ad.get("emp") == u["id"]:
+                    adj[f'{ad.get("emp")}{ad.get("type")}'] = ad.get("d", 0.0)
+        except Exception as adj_err:
+            print(f"[State Notice] Adjustments query fallback: {adj_err}")
+            adj = {}
+
+        quotas = {}
+        try:
+            for x in c.execute("SELECT * FROM quotas"):
+                xd = dict(x)
+                if adm or xd.get("emp") == u["id"]:
+                    quotas[f'{xd.get("emp")}{xd.get("type")}'] = xd.get("days", 0.0)
+        except Exception as q_err:
+            print(f"[State Notice] Quotas query fallback: {q_err}")
+            quotas = {}
+
+        types = []
+        try:
+            for t in c.execute("SELECT * FROM leave_types WHERE active=1"):
+                td = dict(t)
+                types.append([td.get("code"), td.get("name"), td.get("quota", 0.0), td.get("tracked", 1)])
+        except Exception as t_err:
+            print(f"[State Notice] Leave types query fallback: {t_err}")
+            types = []
+
+        hol = []
+        try:
+            for h in c.execute("SELECT * FROM holidays ORDER BY date"):
+                hd = dict(h)
+                hol.append(dict(d=hd.get("date"), n=hd.get("name")))
+        except Exception as h_err:
+            print(f"[State Notice] Holidays query fallback: {h_err}")
+            hol = []
+
+        p = None
+        try:
+            p_row = c.execute("SELECT * FROM policy").fetchone()
+            if p_row:
+                p = dict(p_row)
+        except Exception:
+            p = None
         if not p:
-            c.execute("INSERT OR IGNORE INTO policy(id,quota,max_remote,max_off) VALUES(1,4,3,2)")
-            p = c.execute("SELECT * FROM policy").fetchone()
-        aud = [dict(t=a["at"], who=a["who"], a=a["action"]) for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")] if adm else []
+            try:
+                c.execute("INSERT OR IGNORE INTO policy(id,quota,max_remote,max_off) VALUES(1,4,3,2)")
+                p_row = c.execute("SELECT * FROM policy").fetchone()
+                if p_row:
+                    p = dict(p_row)
+            except Exception:
+                pass
+        if not p:
+            p = {"quota": 4, "max_remote": 3, "max_off": 2}
+
+        aud = []
+        if adm:
+            try:
+                for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60"):
+                    ad = dict(a)
+                    act_text = ad.get("action") or ad.get("a") or ad.get("text") or ad.get("msg") or ad.get("details") or ""
+                    aud.append(dict(t=str(ad.get("at") or ""), who=str(ad.get("who") or ""), a=str(act_text)))
+            except Exception as aud_err:
+                print(f"[State Notice] Audit log query fallback: {aud_err}")
+                aud = []
 
         try:
             ot_sql = """
@@ -1020,25 +1137,45 @@ def state(u=Depends(user)):
             """ + ("" if adm else " WHERE o.emp=?") + " ORDER BY o.id DESC LIMIT 100"
             ot_claims = [
                 dict(
-                    id=row["id"], emp=row["emp"],
-                    emp_name=row["emp_name"] or f"Employee #{row['emp']}",
-                    emp_code=row["emp_code"] or f"EMP{row['emp']:03d}",
-                    date=row["date"], hours=row["hours"], desc=row["work_description"],
-                    status=row["status"], by=row["decided_by"], note=row["note"] or "",
-                    at=row["created_at"]
+                    id=rd.get("id"),
+                    emp=rd.get("emp"),
+                    emp_name=rd.get("emp_name") or f"Employee #{rd.get('emp')}",
+                    emp_code=rd.get("emp_code") or f"EMP{rd.get('emp', 0):03d}",
+                    date=rd.get("date"),
+                    hours=rd.get("hours", 0.0),
+                    desc=rd.get("work_description") or "",
+                    status=rd.get("status", "pending"),
+                    by=rd.get("decided_by"),
+                    note=rd.get("note") or "",
+                    at=rd.get("created_at") or "",
                 )
-                for row in c.execute(ot_sql, () if adm else (u["id"],))
+                for rd in [dict(row) for row in c.execute(ot_sql, () if adm else (u["id"],))]
             ]
         except Exception as ot_err:
             print(f"[State Notice] Overtime query fallback: {ot_err}")
             ot_claims = []
-        my_ot = get_overtime_summary(c, u["id"])
+
+        try:
+            my_ot = get_overtime_summary(c, u["id"])
+        except Exception:
+            my_ot = {"earned_hours": 0.0, "pending_hours": 0.0, "used_hours": 0.0, "locked_hours": 0.0, "available_hours": 0.0}
 
     is_master = bool(ADMIN_EMAIL and u.get("email", "").strip().lower() == ADMIN_EMAIL.strip().lower() and ADMIN_PASSWORD)
     has_pwd = bool(u.get("password_hash")) or is_master
-    return dict(me=u["id"], has_password=has_pwd, employees=emps, requests=reqs, adj=adj, quotas=quotas, types=types, holidays=hol,
-                policy=dict(q=p["quota"], max=p["max_remote"], off=p["max_off"]), audit=aud,
-                overtime=ot_claims, my_ot=my_ot)
+    return dict(
+        me=u["id"],
+        has_password=has_pwd,
+        employees=emps,
+        requests=reqs,
+        adj=adj,
+        quotas=quotas,
+        types=types,
+        holidays=hol,
+        policy=dict(q=p.get("quota", 4), max=p.get("max_remote", 3), off=p.get("max_off", 2)),
+        audit=aud,
+        overtime=ot_claims,
+        my_ot=my_ot,
+    )
 
 
 # ---------- requests ----------
@@ -1138,34 +1275,37 @@ def decide(rid: int, b: DecideIn, u=Depends(admin)):
         r = c.execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
         if not r:
             raise HTTPException(404, "Request not found")
-        if r["emp"] == u["id"]:
+        rd = dict(r)
+        if rd.get("emp") == u["id"]:
             raise HTTPException(403, "You can’t decide your own request")
-        new = flow.get((r["status"], b.action))
+        new = flow.get((rd.get("status"), b.action))
         if not new:
             raise HTTPException(409, "This request was already decided")
         forced = ""
-        if r["status"] == "pending" and b.action == "approve":
-            if r["type"] == "CO":
-                ot = get_overtime_summary(c, r["emp"])
-                hours_needed = r["ot_hours_used"] or (r["days"] * 8.0)
-                if ot["available_hours"] + ot["locked_hours"] < hours_needed:
+        if rd.get("status") == "pending" and b.action == "approve":
+            if rd.get("type") == "CO":
+                ot = get_overtime_summary(c, rd.get("emp"))
+                hours_needed = rd.get("ot_hours_used") or (rd.get("days", 0) * 8.0)
+                if ot.get("available_hours", 0.0) + ot.get("locked_hours", 0.0) < hours_needed:
                     raise HTTPException(409, f"Not enough overtime hours to approve this request (Needs: {hours_needed:g} hrs).")
             else:
-                ty = c.execute("SELECT tracked FROM leave_types WHERE code=?", (r["type"],)).fetchone()
-                if r["kind"] == "leave" and ty and ty["tracked"] and r["days"] > avail(c, r["emp"], r["type"], int(r["start_date"][:4])):
+                ty = c.execute("SELECT tracked FROM leave_types WHERE code=?", (rd.get("type"),)).fetchone()
+                ty_d = dict(ty) if ty else {}
+                if rd.get("kind") == "leave" and ty_d.get("tracked") and rd.get("days", 0) > avail(c, rd.get("emp"), rd.get("type"), int(str(rd.get("start_date"))[:4])):
                     raise HTTPException(409, "Not enough balance. Adjust it first.")
-            msg = team_clash(c, r)
+            msg = team_clash(c, rd)
             if msg and not b.force:
                 raise HTTPException(409, "clash:" + msg)
             forced = " (team-limit override)" if msg else ""
-        note = b.note.strip()[:300] if b.action in ("reject", "revoke") else r["note"]
-        n = c.execute("UPDATE requests SET status=?, decided_by=?, note=? WHERE id=? AND status=?", (new, u["id"], note or None, rid, r["status"])).rowcount
+        note = b.note.strip()[:300] if b.action in ("reject", "revoke") else (rd.get("note") or "")
+        n = c.execute("UPDATE requests SET status=?, decided_by=?, note=? WHERE id=? AND status=?", (new, u["id"], note or None, rid, rd.get("status"))).rowcount
         if not n:
             raise HTTPException(409, "This request was already decided")
-        who = c.execute("SELECT name FROM employees WHERE id=?", (r["emp"],)).fetchone()[0]
-        extra = forced + (" (over WFH quota, override)" if r["over_quota"] and new == "approved" else "")
+        who_row = c.execute("SELECT name FROM employees WHERE id=?", (rd.get("emp"),)).fetchone()
+        who = who_row[0] if who_row else f"Employee #{rd.get('emp')}"
+        extra = forced + (" (over WFH quota, override)" if rd.get("over_quota") and new == "approved" else "")
         verb = "Revoked" if b.action == "revoke" else new.capitalize()
-        log(c, u["name"], f"{verb} {who}’s {r['kind']} request #{rid}{extra}")
+        log(c, u["name"], f"{verb} {who}’s {rd.get('kind', 'leave')} request #{rid}{extra}")
     return {"ok": True}
 
 
@@ -1202,8 +1342,9 @@ def decide_overtime(oid: int, b: OvertimeDecideIn, u=Depends(admin)):
         ot = c.execute("SELECT * FROM overtime_requests WHERE id=?", (oid,)).fetchone()
         if not ot:
             raise HTTPException(404, "Overtime claim not found")
-        if ot["status"] != "pending":
-            raise HTTPException(409, f"This overtime claim was already {ot['status']}")
+        otd = dict(ot)
+        if otd.get("status") != "pending":
+            raise HTTPException(409, f"This overtime claim was already {otd.get('status')}")
 
         new_status = "approved" if b.action == "approve" else "rejected"
         c.execute("""
@@ -1212,9 +1353,10 @@ def decide_overtime(oid: int, b: OvertimeDecideIn, u=Depends(admin)):
             WHERE id=?
         """, (new_status, u["id"], now_str, b.note.strip()[:300], oid))
 
-        emp = c.execute("SELECT name FROM employees WHERE id=?", (ot["emp"],)).fetchone()
-        emp_name = emp["name"] if emp else f"Employee #{ot['emp']}"
-        log(c, u["name"], f"{new_status.capitalize()} {emp_name}’s overtime claim #{oid} of {ot['hours']:g} hrs")
+        emp = c.execute("SELECT name FROM employees WHERE id=?", (otd.get("emp"),)).fetchone()
+        emp_name = (dict(emp).get("name") if emp else None) or f"Employee #{otd.get('emp')}"
+        verb = "Approved" if b.action == "approve" else "Rejected"
+        log(c, u["name"], f"{verb} {emp_name}’s overtime claim #{oid} of {otd.get('hours', 0):g} hrs")
     return {"ok": True}
 
 
@@ -1319,16 +1461,18 @@ def toggle_employee(eid: int, u=Depends(admin)):
         e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
         if not e:
             raise HTTPException(404, "Employee not found")
-        if eid == u["id"] or e["email"] == ADMIN_EMAIL:
+        ed = dict(e)
+        if eid == u["id"] or ed.get("email") == ADMIN_EMAIL:
             raise HTTPException(400, "You cannot remove yourself or the main admin")
-        if e["role"] == "admin" and e["active"] and n_admins(c) < 2:
+        if ed.get("role") == "admin" and ed.get("active") and n_admins(c) < 2:
             raise HTTPException(400, "Cannot remove the only remaining active administrator")
-        if e["active"]:
+        is_active = bool(ed.get("active"))
+        if is_active:
             c.execute("UPDATE requests SET status='cancelled' WHERE emp=? AND status='pending'", (eid,))
             # Immediately revoke all active sessions for deactivated employee
             c.execute("DELETE FROM sessions WHERE user_id=?", (eid,))
-        c.execute("UPDATE employees SET active=? WHERE id=?", (0 if e["active"] else 1, eid))
-        log(c, u["name"], f"{'Removed access for' if e['active'] else 'Restored access for'} {e['name']}")
+        c.execute("UPDATE employees SET active=? WHERE id=?", (0 if is_active else 1, eid))
+        log(c, u["name"], f"{'Removed access for' if is_active else 'Restored access for'} {ed.get('name', '')}")
     return {"ok": True}
 
 
