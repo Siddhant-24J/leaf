@@ -66,14 +66,26 @@ def resolve_db_path(path_str: str) -> str:
 
 DB = resolve_db_path(DB_RAW)
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata"))
-DEFAULT_TYPES = [("CL", "Casual", 12, 1), ("SL", "Sick", 8, 1), ("AL", "Annual", 10, 1), ("UL", "Unpaid", 0, 0)]
+DEFAULT_TYPES = [("CL", "Casual", 12, 1), ("SL", "Sick", 8, 1), ("AL", "Annual", 10, 1), ("CO", "Comp-off (Overtime)", 0, 1), ("UL", "Unpaid", 0, 0)]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS employees(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-  title TEXT DEFAULT '', role TEXT DEFAULT 'employee', active INTEGER DEFAULT 1);
+  emp_code TEXT DEFAULT '', title TEXT DEFAULT '', role TEXT DEFAULT 'employee', active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, emp INTEGER NOT NULL, kind TEXT, type TEXT,
   start_date TEXT, end_date TEXT, part TEXT, days REAL, reason TEXT, status TEXT, decided_by INTEGER,
-  note TEXT, over_quota INTEGER DEFAULT 0);
+  note TEXT, over_quota INTEGER DEFAULT 0, ot_hours_used REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS overtime_requests(
+  id INTEGER PRIMARY KEY,
+  emp INTEGER NOT NULL,
+  date TEXT NOT NULL,
+  hours REAL NOT NULL,
+  work_description TEXT NOT NULL,
+  status TEXT DEFAULT 'pending',
+  decided_by INTEGER,
+  decided_at TEXT,
+  note TEXT DEFAULT '',
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS leave_types(code TEXT PRIMARY KEY, name TEXT, quota REAL, tracked INTEGER DEFAULT 1, active INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS quotas(emp INTEGER, type TEXT, days REAL, PRIMARY KEY(emp, type));
 CREATE TABLE IF NOT EXISTS adjustments(id INTEGER PRIMARY KEY, emp INTEGER, type TEXT, days REAL, reason TEXT, by_id INTEGER, at TEXT, year INTEGER);
@@ -94,6 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp);
 CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date);
 CREATE INDEX IF NOT EXISTS idx_adjustments_emp ON adjustments(emp);
 CREATE INDEX IF NOT EXISTS idx_quotas_emp ON quotas(emp);
+CREATE INDEX IF NOT EXISTS idx_overtime_emp ON overtime_requests(emp);
+CREATE INDEX IF NOT EXISTS idx_overtime_status ON overtime_requests(status);
 """
 
 
@@ -128,10 +142,14 @@ with db() as c:
         "ALTER TABLE policy ADD COLUMN max_off INTEGER DEFAULT 2",
         "ALTER TABLE adjustments ADD COLUMN year INTEGER",
         "ALTER TABLE employees ADD COLUMN password_hash TEXT DEFAULT ''",
+        "ALTER TABLE employees ADD COLUMN emp_code TEXT DEFAULT ''",
+        "ALTER TABLE requests ADD COLUMN ot_hours_used REAL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp)",
         "CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date)",
         "CREATE INDEX IF NOT EXISTS idx_adjustments_emp ON adjustments(emp)",
         "CREATE INDEX IF NOT EXISTS idx_quotas_emp ON quotas(emp)",
+        "CREATE INDEX IF NOT EXISTS idx_overtime_emp ON overtime_requests(emp)",
+        "CREATE INDEX IF NOT EXISTS idx_overtime_status ON overtime_requests(status)",
     ):
         try:
             c.execute(stmt)
@@ -139,9 +157,12 @@ with db() as c:
             pass
     c.execute("UPDATE adjustments SET year=? WHERE year IS NULL", (today().year,))
     c.executemany("INSERT OR IGNORE INTO leave_types(code,name,quota,tracked,active) VALUES(?,?,?,?,1)", DEFAULT_TYPES)
+    c.execute("UPDATE leave_types SET name='Comp-off (Overtime)' WHERE code='CO'")
     c.execute("INSERT OR IGNORE INTO policy(id,quota,max_remote,max_off) VALUES(1,4,3,2)")
-    c.execute("INSERT OR IGNORE INTO employees(name,email,title,role,active) VALUES('Admin',?,'Administrator','admin',1)", (ADMIN_EMAIL,))
+    c.execute("INSERT OR IGNORE INTO employees(name,email,title,role,active,emp_code) VALUES('Admin',?,'Administrator','admin',1,'ADM001')", (ADMIN_EMAIL,))
     c.execute("UPDATE employees SET role='admin', active=1 WHERE email=?", (ADMIN_EMAIL,))
+    c.execute("UPDATE employees SET emp_code='ADM001' WHERE email=? AND (emp_code IS NULL OR emp_code='')", (ADMIN_EMAIL,))
+    c.execute("UPDATE employees SET emp_code = 'EMP' || printf('%03d', id) WHERE (emp_code IS NULL OR emp_code='')")
 
 if ADMIN_PASSWORD in ("admin", "password", "123456", "admin123"):
     print("[SECURITY NOTICE] ADMIN_PASSWORD is set to a common default. Please configure a strong password in production!")
@@ -308,14 +329,44 @@ class AdjIn(BaseModel):
 class EmpIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     email: str = Field(..., min_length=3, max_length=254)
+    emp_code: str = Field("", max_length=50)
     title: str = Field("", max_length=100)
     role: str = Field("employee", max_length=20)
     password: Optional[str] = Field(None, max_length=128)
 
-    @field_validator("name", "title")
+    @field_validator("name", "title", "emp_code")
     def sanitize_person(cls, v):
         if "\x00" in v:
             raise ValueError("Invalid characters detected")
+        return v.strip()
+
+
+class OvertimeIn(BaseModel):
+    date: str = Field(..., max_length=10)
+    hours: float = Field(..., gt=0, le=24)
+    work_description: str = Field(..., min_length=3, max_length=1000)
+
+    @field_validator("work_description")
+    def sanitize_work(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid character in work description")
+        return v.strip()
+
+    @field_validator("hours")
+    def validate_hours(cls, v):
+        if not math.isfinite(v) or v <= 0 or v > 24:
+            raise ValueError("Hours must be between 0.5 and 24")
+        return round(v, 2)
+
+
+class OvertimeDecideIn(BaseModel):
+    action: str = Field(..., max_length=20)
+    note: str = Field("", max_length=300)
+
+    @field_validator("note")
+    def sanitize_note(cls, v):
+        if "\x00" in v:
+            raise ValueError("Invalid character in note")
         return v.strip()
 
 
@@ -569,6 +620,31 @@ def workdays(s, e, part, hols):
     return n / 2 if s == e and part != "full" else n
 
 
+def get_overtime_summary(c, emp_id: int):
+    earned = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='approved'", (emp_id,)).fetchone()[0] or 0.0
+    pending_claims = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+    used_approved = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status IN ('approved','cancellation_requested')", (emp_id,)).fetchone()[0] or 0.0
+    used_pending = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+    available = max(0.0, round(earned - used_approved - used_pending, 2))
+    return {
+        "earned_hours": round(earned, 2),
+        "pending_hours": round(pending_claims, 2),
+        "used_hours": round(used_approved, 2),
+        "locked_hours": round(used_pending, 2),
+        "available_hours": available,
+    }
+
+
+def get_emp_approved_overtime(c, emp_id: int):
+    rows = c.execute("""
+        SELECT id, date, hours, work_description, created_at
+        FROM overtime_requests
+        WHERE emp=? AND status='approved'
+        ORDER BY date DESC LIMIT 8
+    """, (emp_id,)).fetchall()
+    return [dict(id=r["id"], date=r["date"], hours=r["hours"], desc=r["work_description"], at=r["created_at"]) for r in rows]
+
+
 def quota(c, emp, t):
     o = c.execute("SELECT days FROM quotas WHERE emp=? AND type=?", (emp, t)).fetchone()
     if o:
@@ -578,6 +654,9 @@ def quota(c, emp, t):
 
 
 def avail(c, emp, t, year):
+    if t == "CO":
+        ot = get_overtime_summary(c, emp)
+        return round(ot["available_hours"] / 8.0, 2)
     used = c.execute("SELECT COALESCE(SUM(days),0) FROM requests WHERE emp=? AND kind='leave' AND type=? AND status IN ('approved','cancellation_requested') AND start_date LIKE ?", (emp, t, f"{year}%")).fetchone()[0]
     adj = c.execute("SELECT COALESCE(SUM(days),0) FROM adjustments WHERE emp=? AND type=? AND year=?", (emp, t, year)).fetchone()[0]
     return quota(c, emp, t) + adj - used
@@ -611,10 +690,15 @@ def team_clash(c, r):
     return f"Approving this puts more than {limit} people {word} on: {', '.join(bad)}." if bad else ""
 
 
-def rq(r):
-    return dict(id=r["id"], emp=r["emp"], kind=r["kind"], type=r["type"], start=r["start_date"], end=r["end_date"],
-                part=r["part"], days=r["days"], reason=r["reason"], status=r["status"], by=r["decided_by"],
-                note=r["note"], over=bool(r["over_quota"]))
+def rq(r, c=None):
+    d = dict(id=r["id"], emp=r["emp"], kind=r["kind"], type=r["type"], start=r["start_date"], end=r["end_date"],
+             part=r["part"], days=r["days"], reason=r["reason"], status=r["status"], by=r["decided_by"],
+             note=r["note"], over=bool(r["over_quota"]),
+             ot_hours=r["ot_hours_used"] if ("ot_hours_used" in r.keys() and r["ot_hours_used"]) else (round(r["days"] * 8.0, 2) if r["type"] == "CO" else 0.0))
+    if r["type"] == "CO" and c:
+        d["ot_history"] = get_emp_approved_overtime(c, r["emp"])
+        d["ot_summary"] = get_overtime_summary(c, r["emp"])
+    return d
 
 
 def n_admins(c):
@@ -626,10 +710,12 @@ def n_admins(c):
 def state(u=Depends(user)):
     adm = u["role"] == "admin"
     with db() as c:
-        emps = [dict(id=e["id"], n=e["name"], role=e["role"], t=e["title"], on=e["active"], **({"email": e["email"]} if adm else {}))
+        emps = [dict(id=e["id"], code=e["emp_code"] or f"EMP{e['id']:03d}", n=e["name"], role=e["role"], t=e["title"], on=e["active"],
+                     ot_hours=get_overtime_summary(c, e["id"])["available_hours"],
+                     **({"email": e["email"]} if adm else {}))
                 for e in c.execute("SELECT * FROM employees ORDER BY id")]
         q = "SELECT * FROM requests" + ("" if adm else " WHERE emp=?") + " ORDER BY id"
-        reqs = [rq(r) for r in c.execute(q, () if adm else (u["id"],))]
+        reqs = [rq(r, c) for r in c.execute(q, () if adm else (u["id"],))]
         adj = {f'{a["emp"]}{a["type"]}': a["d"] for a in c.execute("SELECT emp,type,SUM(days) d FROM adjustments WHERE year=? GROUP BY emp,type", (today().year,))
                if adm or a["emp"] == u["id"]}
         quotas = {f'{x["emp"]}{x["type"]}': x["days"] for x in c.execute("SELECT * FROM quotas") if adm or x["emp"] == u["id"]}
@@ -637,10 +723,29 @@ def state(u=Depends(user)):
         hol = [dict(d=h["date"], n=h["name"]) for h in c.execute("SELECT * FROM holidays ORDER BY date")]
         p = c.execute("SELECT * FROM policy").fetchone()
         aud = [dict(t=a["at"], who=a["who"], a=a["action"]) for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")] if adm else []
+
+        ot_sql = """
+            SELECT o.*, e.name as emp_name, e.emp_code
+            FROM overtime_requests o
+            JOIN employees e ON o.emp = e.id
+        """ + ("" if adm else " WHERE o.emp=?") + " ORDER BY o.id DESC LIMIT 100"
+        ot_claims = [
+            dict(
+                id=row["id"], emp=row["emp"], emp_name=row["emp_name"],
+                emp_code=row["emp_code"] or f"EMP{row['emp']:03d}",
+                date=row["date"], hours=row["hours"], desc=row["work_description"],
+                status=row["status"], by=row["decided_by"], note=row["note"] or "",
+                at=row["created_at"]
+            )
+            for row in c.execute(ot_sql, () if adm else (u["id"],))
+        ]
+        my_ot = get_overtime_summary(c, u["id"])
+
     is_master = bool(ADMIN_EMAIL and u.get("email", "").strip().lower() == ADMIN_EMAIL.strip().lower() and ADMIN_PASSWORD)
     has_pwd = bool(u.get("password_hash")) or is_master
     return dict(me=u["id"], has_password=has_pwd, employees=emps, requests=reqs, adj=adj, quotas=quotas, types=types, holidays=hol,
-                policy=dict(q=p["quota"], max=p["max_remote"], off=p["max_off"]), audit=aud)
+                policy=dict(q=p["quota"], max=p["max_remote"], off=p["max_off"]), audit=aud,
+                overtime=ot_claims, my_ot=my_ot)
 
 
 # ---------- requests ----------
@@ -690,7 +795,14 @@ def create_request(b: ReqIn, u=Depends(user)):
             raise HTTPException(400, "Those dates are all weekends or holidays")
         if clash(c, tid, b.start, b.end, part):
             raise HTTPException(409, f"{'They already have' if on_behalf else 'You already have'} leave or WFH on these dates")
-        if ty and ty["tracked"]:
+        ot_hours_used = 0.0
+        if ty and ty["code"] == "CO":
+            ot = get_overtime_summary(c, tid)
+            req_hours = round(n * 8.0, 2)
+            if req_hours > ot["available_hours"]:
+                raise HTTPException(409, f"Not enough overtime credit. {tgt['name']} has {ot['available_hours']:g} overtime hours ({round(ot['available_hours'] / 8.0, 1):g} days), but {req_hours:g} hours are required for this leave.")
+            ot_hours_used = req_hours
+        elif ty and ty["tracked"]:
             left = avail(c, tid, ty["code"], s.year)
             if n > left:
                 raise HTTPException(409, f"Not enough balance. {tgt['name']} has {left:g} days left.")
@@ -700,8 +812,9 @@ def create_request(b: ReqIn, u=Depends(user)):
             used = c.execute("SELECT COALESCE(SUM(days),0) FROM requests WHERE emp=? AND kind='wfh' AND status IN ('approved','cancellation_requested') AND start_date LIKE ?", (tid, b.start[:7] + "%")).fetchone()[0]
             over = int(used + n > qt)
         status, by, note = ("approved", u["id"], "Recorded by admin") if on_behalf else ("pending", None, None)
-        c.execute("INSERT INTO requests(emp,kind,type,start_date,end_date,part,days,reason,status,decided_by,note,over_quota) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (tid, b.kind, ty["code"] if ty else None, b.start, b.end, part, n, b.reason.strip()[:500], status, by, note, over))
+        c.execute("""INSERT INTO requests(emp,kind,type,start_date,end_date,part,days,reason,status,decided_by,note,over_quota,ot_hours_used)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (tid, b.kind, ty["code"] if ty else None, b.start, b.end, part, n, b.reason.strip()[:500], status, by, note, over, ot_hours_used))
         log(c, u["name"], f"{'Recorded approved' if on_behalf else 'Submitted'} {b.kind} for {tgt['name']}: {b.start} to {b.end}")
     return {"ok": True}
 
@@ -739,9 +852,15 @@ def decide(rid: int, b: DecideIn, u=Depends(admin)):
             raise HTTPException(409, "This request was already decided")
         forced = ""
         if r["status"] == "pending" and b.action == "approve":
-            ty = c.execute("SELECT tracked FROM leave_types WHERE code=?", (r["type"],)).fetchone()
-            if r["kind"] == "leave" and ty and ty["tracked"] and r["days"] > avail(c, r["emp"], r["type"], int(r["start_date"][:4])):
-                raise HTTPException(409, "Not enough balance. Adjust it first.")
+            if r["type"] == "CO":
+                ot = get_overtime_summary(c, r["emp"])
+                hours_needed = r["ot_hours_used"] or (r["days"] * 8.0)
+                if ot["available_hours"] + ot["locked_hours"] < hours_needed:
+                    raise HTTPException(409, f"Not enough overtime hours to approve this request (Needs: {hours_needed:g} hrs).")
+            else:
+                ty = c.execute("SELECT tracked FROM leave_types WHERE code=?", (r["type"],)).fetchone()
+                if r["kind"] == "leave" and ty and ty["tracked"] and r["days"] > avail(c, r["emp"], r["type"], int(r["start_date"][:4])):
+                    raise HTTPException(409, "Not enough balance. Adjust it first.")
             msg = team_clash(c, r)
             if msg and not b.force:
                 raise HTTPException(409, "clash:" + msg)
@@ -754,6 +873,69 @@ def decide(rid: int, b: DecideIn, u=Depends(admin)):
         extra = forced + (" (over WFH quota, override)" if r["over_quota"] and new == "approved" else "")
         verb = "Revoked" if b.action == "revoke" else new.capitalize()
         log(c, u["name"], f"{verb} {who}’s {r['kind']} request #{rid}{extra}")
+    return {"ok": True}
+
+
+# ---------- overtime endpoints ----------
+@app.post("/api/overtime")
+def claim_overtime(b: OvertimeIn, u=Depends(user)):
+    try:
+        d = date.fromisoformat(b.date)
+    except ValueError:
+        raise HTTPException(400, "Invalid date (YYYY-MM-DD)")
+
+    min_d = today() - timedelta(days=90)
+    max_d = today() + timedelta(days=1)
+    if d < min_d or d > max_d:
+        raise HTTPException(400, "Overtime date must be within the last 90 days")
+
+    now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        c.execute("""
+            INSERT INTO overtime_requests(emp, date, hours, work_description, status, created_at)
+            VALUES(?,?,?,?,?,?)
+        """, (u["id"], b.date, b.hours, b.work_description, "pending", now_str))
+        log(c, u["name"], f"Claimed {b.hours:g} hrs overtime for {b.date}: {b.work_description[:80]}")
+    return {"ok": True}
+
+
+@app.post("/api/overtime/{oid}/decide")
+def decide_overtime(oid: int, b: OvertimeDecideIn, u=Depends(admin)):
+    if b.action not in ("approve", "reject"):
+        raise HTTPException(400, "Action must be approve or reject")
+
+    now_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with db() as c:
+        ot = c.execute("SELECT * FROM overtime_requests WHERE id=?", (oid,)).fetchone()
+        if not ot:
+            raise HTTPException(404, "Overtime claim not found")
+        if ot["status"] != "pending":
+            raise HTTPException(409, f"This overtime claim was already {ot['status']}")
+
+        new_status = "approved" if b.action == "approve" else "rejected"
+        c.execute("""
+            UPDATE overtime_requests
+            SET status=?, decided_by=?, decided_at=?, note=?
+            WHERE id=?
+        """, (new_status, u["id"], now_str, b.note.strip()[:300], oid))
+
+        emp = c.execute("SELECT name FROM employees WHERE id=?", (ot["emp"],)).fetchone()
+        emp_name = emp["name"] if emp else f"Employee #{ot['emp']}"
+        log(c, u["name"], f"{new_status.capitalize()} {emp_name}’s overtime claim #{oid} of {ot['hours']:g} hrs")
+    return {"ok": True}
+
+
+@app.post("/api/overtime/{oid}/cancel")
+def cancel_overtime(oid: int, u=Depends(user)):
+    with db() as c:
+        ot = c.execute("SELECT * FROM overtime_requests WHERE id=? AND emp=?", (oid, u["id"])).fetchone()
+        if not ot:
+            raise HTTPException(404, "Overtime claim not found")
+        if ot["status"] != "pending":
+            raise HTTPException(409, "Only pending overtime claims can be cancelled")
+
+        c.execute("UPDATE overtime_requests SET status='cancelled' WHERE id=?", (oid,))
+        log(c, u["name"], f"Cancelled overtime claim #{oid} of {ot['hours']:g} hrs")
     return {"ok": True}
 
 
@@ -773,6 +955,7 @@ def check_person(name, email, role):
 def add_employee(b: EmpIn, u=Depends(admin)):
     email, name = b.email.strip().lower(), b.name.strip()
     check_person(name, email, b.role)
+    code = b.emp_code.strip()
     p_hash = hash_password(b.password) if b.password else ""
     with db() as c:
         ex = c.execute("SELECT * FROM employees WHERE email=?", (email,)).fetchone()
@@ -780,12 +963,19 @@ def add_employee(b: EmpIn, u=Depends(admin)):
             raise HTTPException(409, "That email already has access")
         if ex:
             if p_hash:
-                c.execute("UPDATE employees SET name=?, title=?, role=?, active=1, password_hash=? WHERE id=?", (name, b.title.strip()[:100], b.role, p_hash, ex["id"]))
+                c.execute("UPDATE employees SET name=?, emp_code=?, title=?, role=?, active=1, password_hash=? WHERE id=?", (name, code, b.title.strip()[:100], b.role, p_hash, ex["id"]))
             else:
-                c.execute("UPDATE employees SET name=?, title=?, role=?, active=1 WHERE id=?", (name, b.title.strip()[:100], b.role, ex["id"]))
+                c.execute("UPDATE employees SET name=?, emp_code=?, title=?, role=?, active=1 WHERE id=?", (name, code, b.title.strip()[:100], b.role, ex["id"]))
+            eid = ex["id"]
         else:
-            c.execute("INSERT INTO employees(name,email,title,role,password_hash) VALUES(?,?,?,?,?)", (name, email, b.title.strip()[:100], b.role, p_hash))
-        log(c, u["name"], f"Gave {name} ({email}) access as {b.role}")
+            c.execute("INSERT INTO employees(name,email,emp_code,title,role,password_hash) VALUES(?,?,?,?,?,?)", (name, email, code, b.title.strip()[:100], b.role, p_hash))
+            eid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        if not code:
+            prefix = "ADM" if b.role == "admin" else "EMP"
+            c.execute("UPDATE employees SET emp_code=? WHERE id=?", (f"{prefix}{eid:03d}", eid))
+
+        log(c, u["name"], f"Gave {name} ({email}" + (f", ID: {code}" if code else "") + f") access as {b.role}")
     return {"ok": True}
 
 
@@ -793,6 +983,7 @@ def add_employee(b: EmpIn, u=Depends(admin)):
 def edit_employee(eid: int, b: EmpEditIn, u=Depends(admin)):
     email, name = b.email.strip().lower(), b.name.strip()
     check_person(name, email, b.role)
+    code = b.emp_code.strip()
     with db() as c:
         e = c.execute("SELECT * FROM employees WHERE id=?", (eid,)).fetchone()
         if not e:
@@ -810,20 +1001,20 @@ def edit_employee(eid: int, b: EmpEditIn, u=Depends(admin)):
 
         if b.password:
             p_hash = hash_password(b.password)
-            c.execute("UPDATE employees SET name=?, email=?, title=?, role=?, password_hash=? WHERE id=?", (name, email, b.title.strip()[:100], b.role, p_hash, eid))
+            c.execute("UPDATE employees SET name=?, email=?, emp_code=?, title=?, role=?, password_hash=? WHERE id=?", (name, email, code, b.title.strip()[:100], b.role, p_hash, eid))
         else:
-            c.execute("UPDATE employees SET name=?, email=?, title=?, role=? WHERE id=?", (name, email, b.title.strip()[:100], b.role, eid))
+            c.execute("UPDATE employees SET name=?, email=?, emp_code=?, title=?, role=? WHERE id=?", (name, email, code, b.title.strip()[:100], b.role, eid))
         changes = []
-        for code, v in b.quotas.items():
-            if not c.execute("SELECT 1 FROM leave_types WHERE code=? AND tracked=1", (code,)).fetchone():
+        for l_code, v in b.quotas.items():
+            if not c.execute("SELECT 1 FROM leave_types WHERE code=? AND tracked=1", (l_code,)).fetchone():
                 continue
             if v is None:
-                c.execute("DELETE FROM quotas WHERE emp=? AND type=?", (eid, code))
+                c.execute("DELETE FROM quotas WHERE emp=? AND type=?", (eid, l_code))
             elif v < 0 or not math.isfinite(v):
                 raise HTTPException(400, "Leave days must be non-negative finite number")
             else:
-                c.execute("INSERT OR REPLACE INTO quotas(emp,type,days) VALUES(?,?,?)", (eid, code, round(v, 2)))
-                changes.append(f"{code}={v:g}")
+                c.execute("INSERT OR REPLACE INTO quotas(emp,type,days) VALUES(?,?,?)", (eid, l_code, round(v, 2)))
+                changes.append(f"{l_code}={v:g}")
         log(c, u["name"], f"Edited {name}" + (f" (yearly quota: {', '.join(changes)})" if changes else ""))
     return {"ok": True}
 
