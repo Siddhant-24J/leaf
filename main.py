@@ -44,7 +44,27 @@ SECRET = env("SECRET_KEY")
 ADMIN_EMAIL = env("ADMIN_EMAIL").strip().lower()
 ADMIN_PASSWORD = env("ADMIN_PASSWORD")
 CLIENT_ID = env("GOOGLE_CLIENT_ID", False)
-DB = os.getenv("DB_PATH", "leave.db")
+DB_RAW = os.getenv("DB_PATH", "leave.db")
+
+
+def resolve_db_path(path_str: str) -> str:
+    db_dir = os.path.dirname(path_str)
+    if db_dir:
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            # Test write permissions
+            test_path = os.path.join(db_dir, ".write_test")
+            with open(test_path, "w") as f:
+                f.write("1")
+            os.remove(test_path)
+            return path_str
+        except Exception:
+            print(f"[Notice] Path '{path_str}' is not writable. Falling back to 'leave.db' in current directory.")
+            return "leave.db"
+    return path_str
+
+
+DB = resolve_db_path(DB_RAW)
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Kolkata"))
 DEFAULT_TYPES = [("CL", "Casual", 12, 1), ("SL", "Sick", 8, 1), ("AL", "Annual", 10, 1), ("UL", "Unpaid", 0, 0)]
 

@@ -12,8 +12,4 @@ services:
       - key: TZ_NAME
         value: Asia/Kolkata
       - key: DB_PATH
-        value: /var/data/leave.db
-    disk:
-      name: leave-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: leave.db

@@ -16,6 +16,6 @@ RUN mkdir -p /data
 EXPOSE 8000
 
 ENV PORT=8000
-ENV DB_PATH=/data/leave.db
+ENV DB_PATH=leave.db
 
 CMD ["python", "main.py"]
