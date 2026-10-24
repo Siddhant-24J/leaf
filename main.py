@@ -1,4 +1,4 @@
-import hashlib, hmac, math, os, re, secrets, sqlite3, time
+import hashlib, hmac, json, math, os, re, secrets, sqlite3, time
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
@@ -132,6 +132,111 @@ def log(c, who, text):
     c.execute("INSERT INTO audit(at,who,action) VALUES(?,?,?)", (now_str, who, text))
 
 
+def export_database_dict(c) -> dict:
+    return {
+        "version": 1,
+        "exported_at": datetime.now(TZ).isoformat(),
+        "employees": [dict(r) for r in c.execute("SELECT * FROM employees")],
+        "requests": [dict(r) for r in c.execute("SELECT * FROM requests")],
+        "overtime_requests": [dict(r) for r in c.execute("SELECT * FROM overtime_requests")],
+        "quotas": [dict(r) for r in c.execute("SELECT * FROM quotas")],
+        "adjustments": [dict(r) for r in c.execute("SELECT * FROM adjustments")],
+        "leave_types": [dict(r) for r in c.execute("SELECT * FROM leave_types")],
+        "holidays": [dict(r) for r in c.execute("SELECT * FROM holidays")],
+        "policy": [dict(r) for r in c.execute("SELECT * FROM policy")],
+    }
+
+
+def import_database_dict(c, data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Invalid backup format")
+
+    restored = {"employees": 0, "requests": 0, "overtime": 0}
+
+    # 1. Employees: upsert by email
+    for e in data.get("employees", []):
+        email = str(e.get("email", "")).strip().lower()
+        if not email:
+            continue
+        ex = c.execute("SELECT id FROM employees WHERE email=?", (email,)).fetchone()
+        p_hash = e.get("password_hash", "") or ""
+        code = e.get("emp_code", "") or ""
+        name = e.get("name", "") or email.split("@")[0]
+        title = e.get("title", "") or ""
+        role = e.get("role", "employee")
+        active = int(e.get("active", 1))
+        if ex:
+            c.execute("""
+                UPDATE employees
+                SET name=?, emp_code=?, title=?, role=?, active=?, password_hash=?
+                WHERE id=?
+            """, (name, code, title, role, active, p_hash, ex["id"]))
+        else:
+            c.execute("""
+                INSERT INTO employees(name, email, emp_code, title, role, active, password_hash)
+                VALUES(?,?,?,?,?,?,?)
+            """, (name, email, code, title, role, active, p_hash))
+        restored["employees"] += 1
+
+    # 2. Leave Types
+    for lt in data.get("leave_types", []):
+        code = lt.get("code")
+        if code:
+            c.execute("""
+                INSERT OR REPLACE INTO leave_types(code, name, quota, tracked, active)
+                VALUES(?,?,?,?,?)
+            """, (code, lt.get("name", code), lt.get("quota", 0), lt.get("tracked", 1), lt.get("active", 1)))
+
+    # 3. Quotas
+    for q in data.get("quotas", []):
+        if q.get("emp") and q.get("type"):
+            c.execute("INSERT OR REPLACE INTO quotas(emp, type, days) VALUES(?,?,?)",
+                      (q["emp"], q["type"], q.get("days", 0)))
+
+    # 4. Holidays
+    for h in data.get("holidays", []):
+        if h.get("date") and h.get("name"):
+            c.execute("INSERT OR REPLACE INTO holidays(date, name) VALUES(?,?)", (h["date"], h["name"]))
+
+    # 5. Policy
+    pol = data.get("policy", [])
+    if pol and isinstance(pol, list) and len(pol) > 0:
+        p = pol[0]
+        c.execute("UPDATE policy SET quota=?, max_remote=?, max_off=? WHERE id=1",
+                  (p.get("quota", 4), p.get("max_remote", 3), p.get("max_off", 2)))
+
+    # 6. Overtime Requests
+    for ot in data.get("overtime_requests", []):
+        if ot.get("emp") and ot.get("date") and ot.get("hours"):
+            c.execute("""
+                INSERT OR REPLACE INTO overtime_requests(id, emp, date, hours, work_description, status, decided_by, decided_at, note, created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
+            """, (ot.get("id"), ot["emp"], ot["date"], ot["hours"], ot.get("work_description", ""),
+                  ot.get("status", "pending"), ot.get("decided_by"), ot.get("decided_at"), ot.get("note"), ot.get("created_at", "")))
+            restored["overtime"] += 1
+
+    # 7. Leave Requests
+    for r in data.get("requests", []):
+        if r.get("emp") and r.get("start_date") and r.get("end_date"):
+            c.execute("""
+                INSERT OR REPLACE INTO requests(id, emp, kind, type, start_date, end_date, part, days, reason, status, decided_by, note, over_quota, ot_hours_used)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (r.get("id"), r["emp"], r.get("kind", "leave"), r.get("type"), r["start_date"], r["end_date"],
+                  r.get("part", "full"), r.get("days", 1.0), r.get("reason", ""), r.get("status", "pending"),
+                  r.get("decided_by"), r.get("note"), r.get("over_quota", 0), r.get("ot_hours_used", 0.0)))
+            restored["requests"] += 1
+
+    # 8. Adjustments
+    for a in data.get("adjustments", []):
+        if a.get("emp") and a.get("type") and a.get("days"):
+            c.execute("""
+                INSERT OR REPLACE INTO adjustments(id, emp, type, days, reason, by_id, at, year)
+                VALUES(?,?,?,?,?,?,?,?)
+            """, (a.get("id"), a["emp"], a["type"], a["days"], a.get("reason", ""), a.get("by_id"), a.get("at"), a.get("year", today().year)))
+
+    return restored
+
+
 with db() as c:
     try:
         c.execute("PRAGMA journal_mode=WAL")
@@ -163,6 +268,20 @@ with db() as c:
     c.execute("UPDATE employees SET role='admin', active=1 WHERE email=?", (ADMIN_EMAIL,))
     c.execute("UPDATE employees SET emp_code='ADM001' WHERE email=? AND (emp_code IS NULL OR emp_code='')", (ADMIN_EMAIL,))
     c.execute("UPDATE employees SET emp_code = 'EMP' || printf('%03d', id) WHERE (emp_code IS NULL OR emp_code='')")
+
+    # Auto-restore data from leave_backup.json on startup if present and database is freshly initialized
+    backup_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leave_backup.json")
+    if os.path.exists(backup_file):
+        try:
+            emp_cnt = c.execute("SELECT COUNT(*) FROM employees").fetchone()[0]
+            req_cnt = c.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+            if emp_cnt <= 1 and req_cnt == 0:
+                with open(backup_file, "r", encoding="utf-8") as bf:
+                    b_data = json.load(bf)
+                    res_cnt = import_database_dict(c, b_data)
+                    print(f"[Persistence] Automatically restored database from leave_backup.json: {res_cnt}")
+        except Exception as err:
+            print(f"[Persistence] Auto-restore notice: {err}")
 
 if ADMIN_PASSWORD in ("admin", "password", "123456", "admin123"):
     print("[SECURITY NOTICE] ADMIN_PASSWORD is set to a common default. Please configure a strong password in production!")
@@ -1120,6 +1239,41 @@ def set_policy(b: PolIn, u=Depends(admin)):
         c.execute("UPDATE policy SET quota=?, max_remote=?, max_off=? WHERE id=1", (b.quota, b.max_remote, b.max_off))
         log(c, u["name"], f"Set policy: WFH {b.quota}/month, max {b.max_remote} remote and {b.max_off} on leave per day")
     return {"ok": True}
+
+
+# ---------- data management: backup & restore ----------
+@app.get("/api/backup")
+def download_backup(u=Depends(admin)):
+    with db() as c:
+        data = export_database_dict(c)
+        log(c, u["name"], "Downloaded full database backup")
+    filename = f"leaf-backup-{today().isoformat()}.json"
+    content = json.dumps(data, indent=2)
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@app.post("/api/restore")
+async def restore_backup(req: Request, u=Depends(admin)):
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Backup file must be a JSON object")
+
+    with db() as c:
+        try:
+            res = import_database_dict(c, body)
+            log(c, u["name"], f"Restored database backup ({res['employees']} employees, {res['requests']} requests, {res['overtime']} overtime records)")
+        except Exception as err:
+            raise HTTPException(400, f"Failed to restore backup: {str(err)}")
+
+    return {"ok": True, "restored": res}
 
 
 app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static"), html=True), name="static")
