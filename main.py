@@ -348,18 +348,27 @@ def import_database_dict(c, data: dict) -> dict:
     return restored
 
 
+def ensure_column_exists(c, table: str, column: str, col_type: str):
+    try:
+        cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    except Exception as e:
+        print(f"[Migration Notice] {table}.{column}: {e}")
+
+
 with db() as c:
     try:
         c.execute("PRAGMA journal_mode=WAL")
     except Exception:
         pass
     c.executescript(SCHEMA)
+    ensure_column_exists(c, "policy", "max_off", "INTEGER DEFAULT 2")
+    ensure_column_exists(c, "adjustments", "year", "INTEGER")
+    ensure_column_exists(c, "employees", "password_hash", "TEXT DEFAULT ''")
+    ensure_column_exists(c, "employees", "emp_code", "TEXT DEFAULT ''")
+    ensure_column_exists(c, "requests", "ot_hours_used", "REAL DEFAULT 0")
     for stmt in (
-        "ALTER TABLE policy ADD COLUMN max_off INTEGER DEFAULT 2",
-        "ALTER TABLE adjustments ADD COLUMN year INTEGER",
-        "ALTER TABLE employees ADD COLUMN password_hash TEXT DEFAULT ''",
-        "ALTER TABLE employees ADD COLUMN emp_code TEXT DEFAULT ''",
-        "ALTER TABLE requests ADD COLUMN ot_hours_used REAL DEFAULT 0",
         "CREATE INDEX IF NOT EXISTS idx_requests_emp ON requests(emp)",
         "CREATE INDEX IF NOT EXISTS idx_requests_dates ON requests(start_date, end_date)",
         "CREATE INDEX IF NOT EXISTS idx_adjustments_emp ON adjustments(emp)",
@@ -493,6 +502,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         field = ".".join(str(x) for x in loc if x != "body")
         details.append(f"{field}: {msg}" if field else msg)
     return JSONResponse(status_code=422, content={"detail": "; ".join(details)})
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    import traceback
+    trace = traceback.format_exc()
+    print(f"[ERROR 500 on {request.method} {request.url.path}]: {trace}")
+    err_detail = str(exc) or "Internal server error"
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {err_detail}"})
 
 
 # ---------- Pydantic Validation Models ----------
@@ -854,10 +872,22 @@ def workdays(s, e, part, hols):
 
 
 def get_overtime_summary(c, emp_id: int):
-    earned = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='approved'", (emp_id,)).fetchone()[0] or 0.0
-    pending_claims = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
-    used_approved = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status IN ('approved','cancellation_requested')", (emp_id,)).fetchone()[0] or 0.0
-    used_pending = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+    try:
+        earned = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='approved'", (emp_id,)).fetchone()[0] or 0.0
+        pending_claims = c.execute("SELECT COALESCE(SUM(hours), 0) FROM overtime_requests WHERE emp=? AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+    except Exception:
+        earned, pending_claims = 0.0, 0.0
+
+    try:
+        used_approved = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status IN ('approved','cancellation_requested')", (emp_id,)).fetchone()[0] or 0.0
+        used_pending = c.execute("SELECT COALESCE(SUM(CASE WHEN ot_hours_used > 0 THEN ot_hours_used ELSE days * 8.0 END), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+    except Exception:
+        try:
+            used_approved = c.execute("SELECT COALESCE(SUM(days * 8.0), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status IN ('approved','cancellation_requested')", (emp_id,)).fetchone()[0] or 0.0
+            used_pending = c.execute("SELECT COALESCE(SUM(days * 8.0), 0) FROM requests WHERE emp=? AND kind='leave' AND type='CO' AND status='pending'", (emp_id,)).fetchone()[0] or 0.0
+        except Exception:
+            used_approved, used_pending = 0.0, 0.0
+
     available = max(0.0, round(earned - used_approved - used_pending, 2))
     return {
         "earned_hours": round(earned, 2),
@@ -869,13 +899,16 @@ def get_overtime_summary(c, emp_id: int):
 
 
 def get_emp_approved_overtime(c, emp_id: int):
-    rows = c.execute("""
-        SELECT id, date, hours, work_description, created_at
-        FROM overtime_requests
-        WHERE emp=? AND status='approved'
-        ORDER BY date DESC LIMIT 8
-    """, (emp_id,)).fetchall()
-    return [dict(id=r["id"], date=r["date"], hours=r["hours"], desc=r["work_description"], at=r["created_at"]) for r in rows]
+    try:
+        rows = c.execute("""
+            SELECT id, date, hours, work_description, created_at
+            FROM overtime_requests
+            WHERE emp=? AND status='approved'
+            ORDER BY date DESC LIMIT 8
+        """, (emp_id,)).fetchall()
+        return [dict(id=r["id"], date=r["date"], hours=r["hours"], desc=r["work_description"], at=r["created_at"]) for r in rows]
+    except Exception:
+        return []
 
 
 def quota(c, emp, t):
@@ -924,13 +957,32 @@ def team_clash(c, r):
 
 
 def rq(r, c=None):
-    d = dict(id=r["id"], emp=r["emp"], kind=r["kind"], type=r["type"], start=r["start_date"], end=r["end_date"],
-             part=r["part"], days=r["days"], reason=r["reason"], status=r["status"], by=r["decided_by"],
-             note=r["note"], over=bool(r["over_quota"]),
-             ot_hours=r["ot_hours_used"] if ("ot_hours_used" in r.keys() and r["ot_hours_used"]) else (round(r["days"] * 8.0, 2) if r["type"] == "CO" else 0.0))
-    if r["type"] == "CO" and c:
-        d["ot_history"] = get_emp_approved_overtime(c, r["emp"])
-        d["ot_summary"] = get_overtime_summary(c, r["emp"])
+    row_dict = dict(r)
+    ot_val = row_dict.get("ot_hours_used")
+    ot_hours = ot_val if ot_val else (round(row_dict.get("days", 0) * 8.0, 2) if row_dict.get("type") == "CO" else 0.0)
+    d = dict(
+        id=row_dict["id"],
+        emp=row_dict["emp"],
+        kind=row_dict.get("kind"),
+        type=row_dict.get("type"),
+        start=row_dict.get("start_date"),
+        end=row_dict.get("end_date"),
+        part=row_dict.get("part", "full"),
+        days=row_dict.get("days", 0),
+        reason=row_dict.get("reason") or "",
+        status=row_dict.get("status", "pending"),
+        by=row_dict.get("decided_by"),
+        note=row_dict.get("note") or "",
+        over=bool(row_dict.get("over_quota", 0)),
+        ot_hours=ot_hours,
+    )
+    if row_dict.get("type") == "CO" and c:
+        try:
+            d["ot_history"] = get_emp_approved_overtime(c, row_dict["emp"])
+            d["ot_summary"] = get_overtime_summary(c, row_dict["emp"])
+        except Exception:
+            d["ot_history"] = []
+            d["ot_summary"] = {"earned_hours": 0, "pending_hours": 0, "used_hours": 0, "locked_hours": 0, "available_hours": 0}
     return d
 
 
@@ -960,21 +1012,26 @@ def state(u=Depends(user)):
             p = c.execute("SELECT * FROM policy").fetchone()
         aud = [dict(t=a["at"], who=a["who"], a=a["action"]) for a in c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 60")] if adm else []
 
-        ot_sql = """
-            SELECT o.*, e.name as emp_name, e.emp_code
-            FROM overtime_requests o
-            JOIN employees e ON o.emp = e.id
-        """ + ("" if adm else " WHERE o.emp=?") + " ORDER BY o.id DESC LIMIT 100"
-        ot_claims = [
-            dict(
-                id=row["id"], emp=row["emp"], emp_name=row["emp_name"],
-                emp_code=row["emp_code"] or f"EMP{row['emp']:03d}",
-                date=row["date"], hours=row["hours"], desc=row["work_description"],
-                status=row["status"], by=row["decided_by"], note=row["note"] or "",
-                at=row["created_at"]
-            )
-            for row in c.execute(ot_sql, () if adm else (u["id"],))
-        ]
+        try:
+            ot_sql = """
+                SELECT o.*, e.name as emp_name, e.emp_code
+                FROM overtime_requests o
+                LEFT JOIN employees e ON o.emp = e.id
+            """ + ("" if adm else " WHERE o.emp=?") + " ORDER BY o.id DESC LIMIT 100"
+            ot_claims = [
+                dict(
+                    id=row["id"], emp=row["emp"],
+                    emp_name=row["emp_name"] or f"Employee #{row['emp']}",
+                    emp_code=row["emp_code"] or f"EMP{row['emp']:03d}",
+                    date=row["date"], hours=row["hours"], desc=row["work_description"],
+                    status=row["status"], by=row["decided_by"], note=row["note"] or "",
+                    at=row["created_at"]
+                )
+                for row in c.execute(ot_sql, () if adm else (u["id"],))
+            ]
+        except Exception as ot_err:
+            print(f"[State Notice] Overtime query fallback: {ot_err}")
+            ot_claims = []
         my_ot = get_overtime_summary(c, u["id"])
 
     is_master = bool(ADMIN_EMAIL and u.get("email", "").strip().lower() == ADMIN_EMAIL.strip().lower() and ADMIN_PASSWORD)
