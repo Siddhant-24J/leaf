@@ -74,7 +74,7 @@ DEFAULT_TYPES = [("CL", "Casual", 12, 1), ("SL", "Sick", 8, 1), ("AL", "Annual",
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS employees(id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-  emp_code TEXT DEFAULT '', title TEXT DEFAULT '', role TEXT DEFAULT 'employee', active INTEGER DEFAULT 1);
+  emp_code TEXT DEFAULT '', title TEXT DEFAULT '', role TEXT DEFAULT 'employee', active INTEGER DEFAULT 1, password_hash TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY, emp INTEGER NOT NULL, kind TEXT, type TEXT,
   start_date TEXT, end_date TEXT, part TEXT, days REAL, reason TEXT, status TEXT, decided_by INTEGER,
   note TEXT, over_quota INTEGER DEFAULT 0, ot_hours_used REAL DEFAULT 0);
@@ -1205,7 +1205,8 @@ def add_employee(b: EmpIn, u=Depends(admin)):
             eid = ex["id"]
         else:
             c.execute("INSERT INTO employees(name,email,emp_code,title,role,password_hash) VALUES(?,?,?,?,?,?)", (name, email, code, b.title.strip()[:100], b.role, p_hash))
-            eid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            row = c.execute("SELECT id FROM employees WHERE email=?", (email,)).fetchone()
+            eid = row["id"] if row else 1
 
         if not code:
             prefix = "ADM" if b.role == "admin" else "EMP"
