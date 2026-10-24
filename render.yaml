@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: leaf-leave-app
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: TZ_NAME
+        value: Asia/Kolkata
+      - key: DB_PATH
+        value: /var/data/leave.db
+    disk:
+      name: leave-data
+      mountPath: /var/data
+      sizeGB: 1

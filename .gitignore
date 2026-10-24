@@ -1,0 +1,27 @@
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Environment secrets
+.env
+
+# SQLite Database
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS and Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.gemini/
