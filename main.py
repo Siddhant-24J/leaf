@@ -1,4 +1,8 @@
 import hashlib, hmac, json, math, os, re, secrets, sqlite3, time
+try:
+    import libsql
+except ImportError:
+    libsql = None
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Dict, Optional, Tuple
@@ -111,16 +115,123 @@ CREATE INDEX IF NOT EXISTS idx_overtime_status ON overtime_requests(status);
 """
 
 
+TURSO_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+USE_TURSO = bool(TURSO_URL and TURSO_AUTH_TOKEN and libsql is not None)
+
+if TURSO_URL and TURSO_AUTH_TOKEN:
+    if libsql is not None:
+        print(f"[Database] Configured to use Turso Cloud Database: {TURSO_URL}")
+    else:
+        print("[Database Warning] TURSO_DATABASE_URL is set, but 'libsql' package is not installed. Falling back to local SQLite.")
+
+
+class LibsqlRow(dict):
+    """Emulates sqlite3.Row for dict access, index access, and dict(r)."""
+    def __init__(self, cols, values):
+        super().__init__(zip(cols, values))
+        self._values = tuple(values)
+        self._cols = tuple(cols)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+class LibsqlCursorWrapper:
+    def __init__(self, cursor):
+        self._c = cursor
+
+    def execute(self, sql, params=()):
+        self._c.execute(sql, params)
+        return self
+
+    def executemany(self, sql, param_seq):
+        self._c.executemany(sql, param_seq)
+        return self
+
+    def fetchone(self):
+        val = self._c.fetchone()
+        if val is None:
+            return None
+        cols = [d[0] for d in self._c.description]
+        return LibsqlRow(cols, val)
+
+    def fetchall(self):
+        vals = self._c.fetchall()
+        if not vals:
+            return []
+        cols = [d[0] for d in self._c.description]
+        return [LibsqlRow(cols, v) for v in vals]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+    @property
+    def lastrowid(self):
+        return getattr(self._c, "lastrowid", None)
+
+    @property
+    def rowcount(self):
+        return getattr(self._c, "rowcount", 0)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+class LibsqlConnectionWrapper:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return LibsqlCursorWrapper(self._conn.cursor())
+
+    def execute(self, sql, params=()):
+        c = self._conn.cursor()
+        c.execute(sql, params)
+        return LibsqlCursorWrapper(c)
+
+    def executemany(self, sql, param_seq):
+        c = self._conn.cursor()
+        c.executemany(sql, param_seq)
+        return LibsqlCursorWrapper(c)
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+    def commit(self):
+        return self._conn.commit()
+
+    def rollback(self):
+        return self._conn.rollback()
+
+    def close(self):
+        return self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 @contextmanager
 def db():
-    c = sqlite3.connect(DB, timeout=10.0)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+    if USE_TURSO:
+        raw = libsql.connect(database=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
+        c = LibsqlConnectionWrapper(raw)
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
+    else:
+        c = sqlite3.connect(DB, timeout=10.0)
+        c.row_factory = sqlite3.Row
+        c.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield c
+            c.commit()
+        finally:
+            c.close()
 
 
 def today():
@@ -258,7 +369,7 @@ with db() as c:
     ):
         try:
             c.execute(stmt)
-        except sqlite3.OperationalError:
+        except Exception:
             pass
     c.execute("UPDATE adjustments SET year=? WHERE year IS NULL", (today().year,))
     c.executemany("INSERT OR IGNORE INTO leave_types(code,name,quota,tracked,active) VALUES(?,?,?,?,1)", DEFAULT_TYPES)
