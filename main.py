@@ -727,7 +727,9 @@ def toggle_employee(eid: int, u=Depends(admin)):
         if not e:
             raise HTTPException(404, "Employee not found")
         if eid == u["id"] or e["email"] == ADMIN_EMAIL:
-            raise HTTPException(400, "The main admin can’t be removed")
+            raise HTTPException(400, "You cannot remove yourself or the main admin")
+        if e["role"] == "admin" and e["active"] and n_admins(c) < 2:
+            raise HTTPException(400, "Cannot remove the only remaining active administrator")
         if e["active"]:
             c.execute("UPDATE requests SET status='cancelled' WHERE emp=? AND status='pending'", (eid,))
             # Immediately revoke all active sessions for deactivated employee

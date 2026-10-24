@@ -71,5 +71,5 @@ Open **[http://localhost:8000](http://localhost:8000)**.
 ---
 
 ## 🔐 Authentication
-- **Admin**: Sign in with `ADMIN_EMAIL` + `ADMIN_PASSWORD` or with Google.
-- **Employees**: Added by admin under **Admin** → **Give someone access** by email. On their first login (via Google or admin invite), they are prompted to create their personal password, allowing them to also sign in directly using email and password. Employees can update their password anytime from their dashboard sidebar.
+- **Administrators**: The initial admin signs in with `ADMIN_EMAIL` + `ADMIN_PASSWORD` (from `.env`) or with Google. Existing admins can create new co-administrators under **Admin** → **+ Create Admin** with custom name, title, email, and password. Co-admins enjoy full permissions to decide leave requests, adjust balances, configure policy & holidays, and manage team members.
+- **Employees**: Added by administrators under **Admin** → **+ Add Employee**. On their first login (via Google or admin invite), they can create their personal password to log in directly with email & password. Employees can update their password anytime from their dashboard sidebar.
